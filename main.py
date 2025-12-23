@@ -1,10 +1,12 @@
 import sys
 import re
 import os
+import requests
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTabWidget, QLineEdit, QPushButton, 
                              QLabel, QFileDialog, QFormLayout, QFrame, QDialog,
-                             QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox)
+                             QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
+                             QListWidget, QListWidgetItem, QAbstractItemView)
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QIcon
 
@@ -16,45 +18,117 @@ class ModernTab(QWidget):
 class FormatSelectionDialog(QDialog):
     def __init__(self, info, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Select Download Format")
-        self.resize(800, 500)
-        self.selected_format = None
+        self.setWindowTitle("Select Download Options")
+        self.resize(1000, 600)
+        self.info = info
+        self.is_playlist = info.get('is_playlist', False)
+        self.selected_urls = []
+        self.selected_format_id = None
         
-        formats = info.get('formats', [])
-        title = info.get('title', 'Unknown Title')
-        duration_sec = info.get('duration', 0)
-        
-        # Format duration
-        if duration_sec:
-            mins, secs = divmod(int(duration_sec), 60)
-            hours, mins = divmod(mins, 60)
-            if hours > 0:
-                duration_str = f"{hours:02d}:{mins:02d}:{secs:02d}"
-            else:
-                duration_str = f"{mins:02d}:{secs:02d}"
+        # Determine strict structure based on type
+        if self.is_playlist:
+            sample_info = info['sample_info']
+            video_title = info.get('title', 'Unknown Playlist')
+            description = f"Playlist: {len(info['entries'])} items"
         else:
-            duration_str = "Unknown"
+            sample_info = info
+            video_title = info.get('title', 'Unknown Title')
+            description = self._format_duration(info.get('duration'))
 
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
 
-        # Video Info Header
+        # Info Header
         info_frame = QFrame()
         info_frame.setObjectName("infoFrame")
         info_layout = QVBoxLayout(info_frame)
-        
-        title_label = QLabel(f"Title: {title}")
+        title_label = QLabel(f"{video_title}")
         title_label.setWordWrap(True)
         title_label.setStyleSheet("font-weight: bold; font-size: 16px; color: #00a8ff;")
-        
-        duration_label = QLabel(f"Duration: {duration_str}")
-        duration_label.setStyleSheet("color: #aaa;")
-        
+        desc_label = QLabel(description)
+        desc_label.setStyleSheet("color: #aaa;")
         info_layout.addWidget(title_label)
-        info_layout.addWidget(duration_label)
+        info_layout.addWidget(desc_label)
         layout.addWidget(info_frame)
+
+        # Main Content Area (Episodes + Formats)
+        content_layout = QHBoxLayout()
         
-        # Table
+        # Episode Table (only if playlist)
+        if self.is_playlist:
+            ep_layout = QVBoxLayout()
+            ep_label = QLabel("Select Episodes:")
+            self.ep_table = QTableWidget()
+            self.ep_table.setColumnCount(3)
+            self.ep_table.setHorizontalHeaderLabels(["No.", "Duration", "Title"])
+            self.ep_table.verticalHeader().setVisible(False)
+            self.ep_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            
+            # Set Column Widths
+            header = self.ep_table.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+
+            # Populate episodes
+            playlist_title = info.get('title', '')
+            entries = info.get('entries', [])
+            self.ep_table.setRowCount(len(entries))
+            
+            for i, entry in enumerate(entries):
+                full_title = entry.get('title') or entry.get('description') or "Unknown"
+                
+                # 1. Clean Title (remove main video/playlist title prefix)
+                display_title = full_title
+                if playlist_title and display_title.startswith(playlist_title):
+                    display_title = display_title[len(playlist_title):].strip()
+                    if display_title.startswith('-') or display_title.startswith('_'):
+                        display_title = display_title[1:].strip()
+                
+                # 2. Format Duration
+                duration = entry.get('duration')
+                if duration:
+                    mins, secs = divmod(int(duration), 60)
+                    hours, mins = divmod(mins, 60)
+                    dur_str = f"{hours:02d}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins:02d}:{secs:02d}"
+                else:
+                    dur_str = "--:--"
+
+                # 3. Create Items
+                # 序号 + Checkbox
+                idx_item = QTableWidgetItem(str(i + 1))
+                idx_item.setCheckState(Qt.CheckState.Checked)
+                item_url = entry.get('url') or entry.get('webpage_url')
+                idx_item.setData(Qt.ItemDataRole.UserRole, item_url)
+                self.ep_table.setItem(i, 0, idx_item)
+                
+                # Duration
+                dur_item = QTableWidgetItem(dur_str)
+                dur_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.ep_table.setItem(i, 1, dur_item)
+                
+                # Title
+                self.ep_table.setItem(i, 2, QTableWidgetItem(display_title))
+                
+            ep_layout.addWidget(ep_label)
+            ep_layout.addWidget(self.ep_table)
+            
+            # Select All/None
+            sel_btn_layout = QHBoxLayout()
+            btn_all = QPushButton("Select All")
+            btn_all.clicked.connect(lambda: self._set_all_checked(True))
+            btn_none = QPushButton("Select None")
+            btn_none.clicked.connect(lambda: self._set_all_checked(False))
+            sel_btn_layout.addWidget(btn_all)
+            sel_btn_layout.addWidget(btn_none)
+            ep_layout.addLayout(sel_btn_layout)
+            
+            content_layout.addLayout(ep_layout, stretch=2)
+
+        # Format List
+        fmt_layout = QVBoxLayout()
+        fmt_label = QLabel("Select Resolution/Format (Based on first video):" if self.is_playlist else "Select Format:")
+        
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["Code", "Extension", "Resolution", "Size", "Note"])
@@ -62,34 +136,16 @@ class FormatSelectionDialog(QDialog):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.verticalHeader().setVisible(False)
-        layout.addWidget(self.table)
+        self._populate_formats(sample_info.get('formats', []))
         
-        # Populate table
-        self.table.setRowCount(len(formats))
-        for i, fmt in enumerate(formats):
-            # Code
-            self.table.setItem(i, 0, QTableWidgetItem(str(fmt.get('format_id', ''))))
-            # Extension
-            self.table.setItem(i, 1, QTableWidgetItem(str(fmt.get('ext', ''))))
-            # Resolution
-            res = f"{fmt.get('width', '?')}x{fmt.get('height', '?')}"
-            self.table.setItem(i, 2, QTableWidgetItem(res))
-            # Size
-            filesize = fmt.get('filesize') or fmt.get('filesize_approx')
-            size_str = f"{filesize/1024/1024:.1f} MB" if filesize else "N/A"
-            self.table.setItem(i, 3, QTableWidgetItem(size_str))
-            # Note description
-            note = fmt.get('format_note', '')
-            vcodec = fmt.get('vcodec', 'none')
-            acodec = fmt.get('acodec', 'none')
-            if vcodec != 'none' and acodec == 'none':
-                note += " (Video Only)"
-            elif vcodec == 'none' and acodec != 'none':
-                note += " (Audio Only)"
-            self.table.setItem(i, 4, QTableWidgetItem(note))
+        fmt_layout.addWidget(fmt_label)
+        fmt_layout.addWidget(self.table)
+        content_layout.addLayout(fmt_layout, stretch=2 if self.is_playlist else 1)
+        
+        layout.addLayout(content_layout)
 
         # Options
-        self.chk_merge = QCheckBox("Merge Best Audio (Use for Video-Only streams)")
+        self.chk_merge = QCheckBox("Merge Best Audio (Recommended for HD Video)")
         self.chk_merge.setChecked(True)
         layout.addWidget(self.chk_merge)
 
@@ -105,8 +161,8 @@ class FormatSelectionDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(download_btn)
         layout.addLayout(btn_layout)
-        
-        # Apply styles
+
+        # Styles
         self.setStyleSheet("""
             QDialog { background-color: #1a1a1a; color: #fff; }
             #infoFrame { background-color: #252525; border-radius: 8px; padding: 10px; }
@@ -118,20 +174,163 @@ class FormatSelectionDialog(QDialog):
             QCheckBox { color: #ccc; spacing: 8px; }
         """)
 
-    def accept_selection(self):
-        selected_items = self.table.selectedItems()
-        if not selected_items:
-            return
+    def _format_duration(self, seconds):
+        if not seconds: return "Unknown Duration"
+        mins, secs = divmod(int(seconds), 60)
+        hours, mins = divmod(mins, 60)
+        if hours > 0:
+            return f"Duration: {hours:02d}:{mins:02d}:{secs:02d}"
+        return f"Duration: {mins:02d}:{secs:02d}"
+
+    def _populate_formats(self, formats):
+        # Group formats by resolution and keep only the largest file for each resolution
+        resolution_map = {}
+        best_audio = None
+        best_audio_bitrate = 0
         
-        row = selected_items[0].row()
+        for fmt in formats:
+            # Calculate resolution
+            width = fmt.get('width', 0)
+            height = fmt.get('height', 0)
+            resolution = f"{width}x{height}"
+            
+            vcodec = fmt.get('vcodec', 'none')
+            acodec = fmt.get('acodec', 'none')
+            
+            # Check if it's an audio-only format
+            if vcodec == 'none' and acodec != 'none':
+                # Get audio bitrate (higher is better)
+                bitrate = fmt.get('abr') or fmt.get('tbr') or fmt.get('asr') or 0
+                
+                # Keep the best audio format
+                if bitrate > best_audio_bitrate:
+                    best_audio_bitrate = bitrate
+                    best_audio = fmt
+            else:
+                # Skip invalid video resolutions (but not audio)
+                if resolution == "0x0":
+                    continue
+                
+                # Get file size
+                sz = fmt.get('filesize') or fmt.get('filesize_approx') or 0
+                
+                # Check if this resolution already exists
+                if resolution in resolution_map:
+                    # Compare file sizes and keep the larger one
+                    existing_sz = resolution_map[resolution].get('filesize') or resolution_map[resolution].get('filesize_approx') or 0
+                    if sz > existing_sz:
+                        resolution_map[resolution] = fmt
+                else:
+                    # Add new resolution to map
+                    resolution_map[resolution] = fmt
+        
+        # Convert map to sorted list (by resolution from highest to lowest)
+        sorted_formats = []
+        for res, fmt in resolution_map.items():
+            sorted_formats.append(fmt)
+        
+        # Sort by resolution (height descending)
+        def get_height(fmt):
+            try:
+                return int(fmt.get('height', 0))
+            except:
+                return 0
+        
+        sorted_formats.sort(key=get_height, reverse=True)
+        
+        # Add best audio format if found
+        if best_audio:
+            sorted_formats.append(best_audio)
+        
+        # Populate the table with filtered formats
+        self.table.setRowCount(len(sorted_formats))
+        for i, fmt in enumerate(sorted_formats):
+            self.table.setItem(i, 0, QTableWidgetItem(str(fmt.get('format_id', ''))))
+            self.table.setItem(i, 1, QTableWidgetItem(str(fmt.get('ext', ''))))
+            
+            # Handle resolution display
+            width = fmt.get('width', 0)
+            height = fmt.get('height', 0)
+            vcodec = fmt.get('vcodec', 'none')
+            acodec = fmt.get('acodec', 'none')
+            
+            if vcodec == 'none' and acodec != 'none':
+                # Audio-only format
+                res_display = "Audio Only"
+            else:
+                # Video format
+                res_display = f"{width}x{height}"
+            
+            self.table.setItem(i, 2, QTableWidgetItem(res_display))
+            
+            # Handle size display
+            sz = fmt.get('filesize') or fmt.get('filesize_approx')
+            size_str = f"{sz/1024/1024:.1f} MB" if sz else "N/A"
+            self.table.setItem(i, 3, QTableWidgetItem(size_str))
+            
+            # Handle note display
+            note = fmt.get('format_note', '')
+            if vcodec != 'none' and acodec == 'none': 
+                note += " (Video Only)"
+            elif vcodec == 'none' and acodec != 'none': 
+                # For audio, add bitrate info if available
+                bitrate = fmt.get('abr') or fmt.get('tbr') or 0
+                if bitrate:
+                    note += f" (Audio Only, {bitrate} kbps)"
+                else:
+                    note += " (Audio Only)"
+            
+            self.table.setItem(i, 4, QTableWidgetItem(note.strip()))
+
+    def _set_all_checked(self, state):
+        for i in range(self.ep_table.rowCount()):
+            item = self.ep_table.item(i, 0)
+            item.setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked)
+
+    def accept_selection(self):
+        # 1. Get Format
+        selected_fmt_items = self.table.selectedItems()
+        if not selected_fmt_items:
+            # Fallback to 'best' if nothing selected? Or prevent?
+            # Let's enforce selection for now
+            return
+
+        row = selected_fmt_items[0].row()
         fmt_id = self.table.item(row, 0).text()
         fmt_note = self.table.item(row, 4).text()
         
-        self.selected_format = fmt_id
-        # Logic: If video-only and merge checked, append +bestaudio
+        final_fmt = fmt_id
         if "Video Only" in fmt_note and self.chk_merge.isChecked():
-            self.selected_format += "+bestaudio"
-            
+            final_fmt += "+bestaudio"
+        self.selected_format_id = final_fmt
+
+        # 2. Get URLs
+        if self.is_playlist:
+            self.selected_urls = []
+            for i in range(self.ep_table.rowCount()):
+                idx_item = self.ep_table.item(i, 0)
+                title_item = self.ep_table.item(i, 2)
+                if idx_item.checkState() == Qt.CheckState.Checked:
+                    # Format as: P01 Title
+                    try:
+                        seq_num = int(idx_item.text())
+                        pref_title = f"P{seq_num:02d} {title_item.text()}"
+                    except:
+                        pref_title = f"{idx_item.text()} {title_item.text()}"
+                        
+                    self.selected_urls.append({
+                        'url': idx_item.data(Qt.ItemDataRole.UserRole),
+                        'title': pref_title
+                    })
+        else:
+            self.selected_urls = [{
+                'url': self.info['webpage_url'],
+                'title': self.info.get('title', 'video')
+            }]
+
+        if not self.selected_urls:
+            return  # Must select at least one
+
         self.accept()
 
 class AnalysisWorker(QThread):
@@ -146,16 +345,150 @@ class AnalysisWorker(QThread):
     def run(self):
         ydl_opts = {
             'quiet': True,
-            'no_color': True
+            'no_color': True,
         }
+        
+        # Bilibili requires full extraction to get titles for multi-page videos/playlists properly
+        # YouTube needs extract_flat to avoid slowly fetching every video in a playlist
+        if 'bilibili' not in self.url and 'b23.tv' not in self.url:
+             ydl_opts['extract_flat'] = 'in_playlist'
+        
         if self.proxy:
             ydl_opts['proxy'] = self.proxy
             
         try:
+            # 1. Try Bilibili Specific API for multi-page videos
+            if 'bilibili.com' in self.url or 'b23.tv' in self.url:
+                try:
+                    effective_url = self.url
+                    if 'b23.tv' in effective_url:
+                        # Follow redirect for short links
+                        try:
+                            s = requests.Session()
+                            if self.proxy:
+                                s.proxies = {'http': self.proxy, 'https': self.proxy}
+                            r = s.head(effective_url, allow_redirects=True, timeout=5)
+                            effective_url = r.url
+                        except:
+                            pass
+                    
+                    bvid_match = re.search(r'(BV[a-zA-Z0-9]{10}|av[0-9]+)', effective_url)
+                    if bvid_match:
+                        bvid = bvid_match.group(1)
+                        print(f"[DEBUG] Extracted BV ID: {bvid}")
+                        api_url = 'https://api.bilibili.com/x/web-interface/view'
+                        params = {'bvid': bvid} if bvid.startswith('BV') else {'aid': bvid[2:]}
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                            'Referer': 'https://www.bilibili.com/'
+                        }
+                        
+                        s = requests.Session()
+                        if self.proxy:
+                            s.proxies = {'http': self.proxy, 'https': self.proxy}
+                        
+                        resp = s.get(api_url, params=params, headers=headers, timeout=10)
+                        api_data = resp.json()
+                        print(f"[DEBUG] API response code: {api_data.get('code')}")
+                        
+                        if api_data.get('code') == 0:
+                            v_data = api_data['data']
+                            pages = v_data.get('pages', [])
+                            print(f"[DEBUG] Pages count: {len(pages)}")
+                            
+                            # Only use API for multi-page videos
+                            if len(pages) > 1:
+                                print(f"[DEBUG] Multi-page video detected")
+                                entries = []
+                                for p in pages:
+                                    p_num = p.get('page', 1)
+                                    p_url = f"https://www.bilibili.com/video/{bvid}?p={p_num}"
+                                    entries.append({
+                                        'title': p.get('part', f"P{p_num}"),
+                                        'duration': p.get('duration'),
+                                        'url': p_url,
+                                        'webpage_url': p_url,
+                                        'id': f"{bvid}_p{p_num}"
+                                    })
+                                
+                                import yt_dlp
+                                with yt_dlp.YoutubeDL({'quiet': True, 'no_color': True, 'proxy': self.proxy}) as ydl:
+                                    # Get format info from the first page
+                                    sample_info = ydl.extract_info(entries[0]['url'], download=False)
+                                
+                                final_info = {
+                                    'is_playlist': True,
+                                    'title': v_data.get('title', 'Bilibili Multi-page'),
+                                    'entries': entries,
+                                    'sample_info': sample_info,
+                                    'webpage_url': effective_url
+                                }
+                                self.finished.emit(final_info)
+                                return
+                            # For single-page videos, fall through to yt-dlp below
+                            print(f"[DEBUG] Single-page video, falling through to yt-dlp")
+                        else:
+                            print(f"[DEBUG] API returned non-zero code: {api_data.get('code')}, {api_data.get('message')}")
+                except Exception as e:
+                    print(f"Bilibili API failed: {e}")
+
+
+            # 2. Default extraction with yt-dlp
+            print(f"[DEBUG] Starting yt-dlp extraction for: {self.url}")
             import yt_dlp
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(self.url, download=False)
-                self.finished.emit(info)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # 1. Initial extraction
+                    print(f"[DEBUG] Calling ydl.extract_info...")
+                    info = ydl.extract_info(self.url, download=False)
+                    print(f"[DEBUG] extract_info completed, type: {info.get('_type') if info else 'None'}")
+                    
+                    # Check if it is a playlist
+                    if info.get('_type') == 'playlist' and 'entries' in info:
+                        print(f"[DEBUG] Detected as playlist")
+                        entries = list(info.get('entries', []))
+                        if not entries:
+                             raise Exception("Playlist is empty")
+                             
+                        # Get sample format from the first entry
+                        sample_entry = entries[0]
+                        sample_url = sample_entry.get('url') or sample_entry.get('webpage_url')
+                        if not sample_url:
+                            sample_url = self.url 
+                        
+                        with yt_dlp.YoutubeDL({'quiet':True, 'no_color':True, 'proxy': self.proxy}) as ydl_sample:
+                            sample_info = ydl_sample.extract_info(sample_url, download=False)
+                        
+                        final_info = {
+                            'is_playlist': True,
+                            'title': info.get('title', 'Playlist'),
+                            'entries': entries,
+                            'sample_info': sample_info,
+                            'webpage_url': info.get('webpage_url', self.url)
+                        }
+                        self.finished.emit(final_info)
+                    
+                    else:
+                        # Single video
+                        print(f"[DEBUG] Detected as single video")
+                        if 'formats' not in info:
+                            print(f"[DEBUG] No formats, re-extracting...")
+                            # Re-extract fully
+                            if 'extract_flat' in ydl_opts:
+                                ydl_opts.pop('extract_flat')
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl_full:
+                                 info = ydl_full.extract_info(self.url, download=False)
+                        else:
+                            print(f"[DEBUG] Found {len(info.get('formats', []))} formats")
+
+                        info['is_playlist'] = False
+                        print(f"[DEBUG] Emitting single video: {info.get('title')}")
+                        self.finished.emit(info)
+                        print(f"[DEBUG] Emit completed")
+            except Exception as yt_err:
+                print(f"[DEBUG] yt-dlp extraction error: {yt_err}")
+                raise
+                    
         except Exception as e:
             # Clean ANSI codes from error message
             error_msg = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', str(e))
@@ -169,9 +502,10 @@ class DownloadWorker(QThread):
     error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, url, path, format_str=None, proxy=None):
+    def __init__(self, urls, path, format_str=None, proxy=None):
         super().__init__()
-        self.url = url
+        # Ensure urls is a list
+        self.urls = urls if isinstance(urls, list) else [urls]
         self.path = path
         self.format_str = format_str
         self.proxy = proxy
@@ -182,6 +516,8 @@ class DownloadWorker(QThread):
         self._is_cancelled = True
 
     def run(self):
+        total_videos = len(self.urls)
+        
         ydl_opts = {
             'format': self.format_str if self.format_str else 'best',
             'outtmpl': f'{self.path}/%(title)s.%(ext)s',
@@ -194,26 +530,56 @@ class DownloadWorker(QThread):
         if self.proxy:
             ydl_opts['proxy'] = self.proxy
 
-        try:
-            import yt_dlp
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # We need to check cancellation before starting extraction or download
-                if self._is_cancelled:
-                    raise DownloadCancelledException()
+        import yt_dlp
+        
+        for i, item_data in enumerate(self.urls):
+            url = item_data['url']
+            title = item_data['title']
+            
+            # Check cancellation at start of each video
+            if self._is_cancelled:
+                self.error.emit("Download cancelled by user.")
+                return
+
+            try:
+                msg = f"Processing ({i+1}/{total_videos})..." if total_videos > 1 else "Starting download..."
+                self.progress.emit(msg)
                 
-                self.progress.emit("Starting download...")
-                info = ydl.extract_info(self.url, download=True)
-                title = info.get('title', 'Video')
-                self.finished.emit(f"Download Complete: {title}")
-        except DownloadCancelledException:
-            self._cleanup_partial_file()
-            self.error.emit("Download cancelled by user.")
-        except Exception as e:
-            if "Download cancelled" in str(e):
+                if not url:
+                    raise Exception("Missing video URL")
+
+                # Update outtmpl with specific title
+                current_opts = ydl_opts.copy()
+                # Sanitize title for filename
+                safe_title = re.sub(r'[\\/*?:"<>|]', "_", title).strip()
+                current_opts['outtmpl'] = f'{self.path}/{safe_title}.%(ext)s'
+
+                with yt_dlp.YoutubeDL(current_opts) as ydl:
+                    if self._is_cancelled: raise DownloadCancelledException()
+                    
+                    self.progress.emit(f"Analyzing ({i+1}/{total_videos}): {title}")
+                    ydl.download([url])
+                    
+            except DownloadCancelledException:
                 self._cleanup_partial_file()
                 self.error.emit("Download cancelled by user.")
-            else:
-                self.error.emit(str(e))
+                return # Stop entire batch
+            except Exception as e:
+                # If one fails, maybe continue? Or stop? 
+                # Let's emit error but try next? Or stop?
+                # Usually users prefer stopping on error or explicit error report.
+                # For now, let's report error string but continue if it's not cancellation
+                if "Download cancelled" in str(e):
+                    self._cleanup_partial_file()
+                    self.error.emit("Download cancelled by user.")
+                    return
+
+                self.error.emit(f"Error on video {i+1}: {str(e)}")
+                # Continue to next video?
+                continue
+        
+        if not self._is_cancelled:
+            self.finished.emit("Batch Download Complete!" if total_videos > 1 else "Download Complete!")
 
     def _cleanup_partial_file(self):
         if not self._current_file:
@@ -374,18 +740,24 @@ class ModernTab(QWidget):
         self.current_worker.start()
 
     def on_analysis_finished(self, info):
+        # Wait for thread to finish before resetting
+        if self.current_worker and self.current_worker.isRunning():
+            self.current_worker.wait()
         self.reset_action_button()
         self.status_label.setText("Select a format to download")
         
         dialog = FormatSelectionDialog(info, self)
         if dialog.exec():
             # User selected something
-            format_str = dialog.selected_format
-            self.start_real_download(info['webpage_url'], format_str)
+            format_str = dialog.selected_format_id
+            urls = dialog.selected_urls
+            # Get playlist title if applicable
+            playlist_title = info.get('title') if info.get('is_playlist') else None
+            self.start_real_download(urls, format_str, playlist_title)
         else:
             self.status_label.setText("Download cancelled")
 
-    def start_real_download(self, url, format_str):
+    def start_real_download(self, urls, format_str, playlist_title=None):
         path = "."
         proxy = None
         if self.settings_tab:
@@ -394,11 +766,27 @@ class ModernTab(QWidget):
             px = self.settings_tab.proxy_input.text()
             if px: proxy = px
 
+        # If it's a playlist and multiple items are selected, create a subfolder
+        if playlist_title and len(urls) > 1:
+            # Sanitize folder name
+            safe_title = re.sub(r'[\\/*?:"<>|]', "_", playlist_title).strip()
+            # Truncate very long titles to avoid path length issues
+            if len(safe_title) > 150:
+                safe_title = safe_title[:150]
+            
+            path = os.path.abspath(os.path.join(path, safe_title))
+            if not os.path.exists(path):
+                try:
+                    os.makedirs(path, exist_ok=True)
+                except Exception as e:
+                    self.status_label.setText(f"Error creating directory: {e}")
+                    # Fallback to original path if fail
+
         self.action_btn.setText("Cancel Download")
         self.action_btn.setEnabled(True)
         self.action_btn.setStyleSheet("background-color: #e74c3c;") # Red for cancel
         
-        self.current_worker = DownloadWorker(url, path, format_str, proxy)
+        self.current_worker = DownloadWorker(urls, path, format_str, proxy)
         self.current_worker.finished.connect(self.on_finished)
         self.current_worker.error.connect(self.on_error)
         self.current_worker.progress.connect(self.on_progress)
