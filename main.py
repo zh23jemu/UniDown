@@ -197,6 +197,11 @@ class FormatSelectionDialog(QDialog):
             vcodec = fmt.get('vcodec', 'none')
             acodec = fmt.get('acodec', 'none')
             
+            # Skip mhtml formats
+            ext = fmt.get('ext', '').lower()
+            if ext == 'mhtml':
+                continue
+            
             # Check if it's an audio-only format
             if vcodec == 'none' and acodec != 'none':
                 # Get audio bitrate (higher is better)
@@ -346,11 +351,12 @@ class AnalysisWorker(QThread):
         ydl_opts = {
             'quiet': True,
             'no_color': True,
+            'cookiesfrombrowser': ('firefox',),
         }
         
         # Bilibili requires full extraction to get titles for multi-page videos/playlists properly
         # YouTube needs extract_flat to avoid slowly fetching every video in a playlist
-        if 'bilibili' not in self.url and 'b23.tv' not in self.url:
+        if 'bilibili' not in self.url and 'b23.tv' not in self.url and 'youtube.com' not in self.url and 'youtu.be' not in self.url:
              ydl_opts['extract_flat'] = 'in_playlist'
         
         if self.proxy:
@@ -511,6 +517,10 @@ class DownloadWorker(QThread):
         self.proxy = proxy
         self._is_cancelled = False
         self._current_file = None
+        # Track video information for detailed progress
+        self.total_videos = len(self.urls)
+        self.current_video_index = 0
+        self.current_video_title = ''
 
     def stop(self):
         self._is_cancelled = True
@@ -518,14 +528,53 @@ class DownloadWorker(QThread):
     def run(self):
         total_videos = len(self.urls)
         
+        # Define progress hook function to show detailed progress
+        def progress_hook(d):
+            if d.get('filename'):
+                self._current_file = d['filename']
+                
+            if self._is_cancelled:
+                # Raising an exception inside the hook is a common way to stop yt-dlp
+                raise DownloadCancelledException("Download cancelled")
+                
+            if d['status'] == 'downloading':
+                # Helper to strip ANSI codes
+                def clean(s):
+                    if not s: return ""
+                    return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', s)
+
+                percent = clean(d.get('_percent_str', '0%')).strip()
+                # Try to get total size
+                total = clean(d.get('_total_bytes_str') or d.get('_total_bytes_approx_str', 'unknown size'))
+                speed = clean(d.get('_speed_str', '0B/s'))
+                eta = clean(d.get('_eta_str', '00:00'))
+                
+                # Get filename without path
+                filename = d.get('filename', 'Unknown')
+                file_basename = os.path.basename(filename)
+                
+                # Show detailed progress with video number and title
+                progress_msg = f"[{self.current_video_index}/{total_videos}] {self.current_video_title} ({percent} at {speed}, ETA: {eta})"
+                # Clear the line and print new progress in one line
+                print(f"\r  {progress_msg}", end='', flush=True)
+                self.progress.emit(progress_msg)
+            elif d['status'] == 'finished':
+                filename = d.get('filename', 'Unknown')
+                file_basename = os.path.basename(filename)
+                # Show completion message
+                finish_msg = f"[{self.current_video_index}/{total_videos}] {self.current_video_title} - Download Complete!"
+                print(f"\r  {finish_msg}                    ")  # Extra spaces to clear any remaining text
+                self.progress.emit("Finalizing file...")
+
         ydl_opts = {
             'format': self.format_str if self.format_str else 'best',
             'outtmpl': f'{self.path}/%(title)s.%(ext)s',
             'noplaylist': True,
-            'progress_hooks': [self.progress_hook],
+            'progress_hooks': [progress_hook],
             'quiet': True,
             'no_warnings': True,
-            'no_color': True
+            'no_color': True,
+            'cookiesfrombrowser': ('firefox',),
         }
         if self.proxy:
             ydl_opts['proxy'] = self.proxy
@@ -535,6 +584,10 @@ class DownloadWorker(QThread):
         for i, item_data in enumerate(self.urls):
             url = item_data['url']
             title = item_data['title']
+            
+            # Update current video info for progress tracking
+            self.current_video_index = i + 1
+            self.current_video_title = title
             
             # Check cancellation at start of each video
             if self._is_cancelled:
@@ -551,7 +604,7 @@ class DownloadWorker(QThread):
                 # Update outtmpl with specific title
                 current_opts = ydl_opts.copy()
                 # Sanitize title for filename
-                safe_title = re.sub(r'[\\/*?:"<>|]', "_", title).strip()
+                safe_title = re.sub(r'[\\/*?::"<>|]', "_", title).strip()
                 current_opts['outtmpl'] = f'{self.path}/{safe_title}.%(ext)s'
 
                 with yt_dlp.YoutubeDL(current_opts) as ydl:
@@ -578,8 +631,49 @@ class DownloadWorker(QThread):
                 # Continue to next video?
                 continue
         
+        # Check if all videos were downloaded successfully
         if not self._is_cancelled:
-            self.finished.emit("Batch Download Complete!" if total_videos > 1 else "Download Complete!")
+            # Check download results
+            downloaded_files = []
+            for filename in os.listdir(self.path):
+                if filename.endswith((".mp4", ".mkv", ".webm", ".flv", ".avi", ".mov", ".wmv", ".mp3", ".m4a")):
+                    # 移除扩展名，只保留文件名
+                    name_without_ext = os.path.splitext(filename)[0]
+                    downloaded_files.append(name_without_ext)
+            
+            # Find missing videos
+            missing_files = []
+            expected_files = [re.sub(r'[\\/*?::"<>|]', "_", item['title']).strip() for item in self.urls]
+            
+            for expected in expected_files:
+                found = False
+                for downloaded in downloaded_files:
+                    if downloaded == expected or downloaded.startswith(expected):
+                        found = True
+                        break
+                if not found:
+                    missing_files.append(expected)
+            
+            if missing_files and total_videos > 1:
+                # Retry missing downloads
+                print(f"\nFound {len(missing_files)} missing files, retrying...")
+                self.progress.emit(f"Retrying {len(missing_files)} missing files...")
+                
+                # Find the URLs for missing files
+                missing_urls = []
+                for item in self.urls:
+                    safe_title = re.sub(r'[\\/*?::"<>|]', "_", item['title']).strip()
+                    if safe_title in missing_files:
+                        missing_urls.append(item)
+                
+                if missing_urls:
+                    # Retry with the missing URLs
+                    retry_worker = DownloadWorker(missing_urls, self.path, self.format_str, self.proxy)
+                    retry_worker.run()
+            else:
+                self.finished.emit("Batch Download Complete!" if total_videos > 1 else "Download Complete!")
+        else:
+            self.finished.emit("Download cancelled by user.")
 
     def _cleanup_partial_file(self):
         if not self._current_file:
@@ -599,31 +693,6 @@ class DownloadWorker(QThread):
                     print(f"Cleaned up: {f_path}") # Debug info
                 except OSError:
                     pass
-
-    def progress_hook(self, d):
-        if d.get('filename'):
-            self._current_file = d['filename']
-            
-        if self._is_cancelled:
-            # Raising an exception inside the hook is a common way to stop yt-dlp
-            raise DownloadCancelledException("Download cancelled")
-            
-        if d['status'] == 'downloading':
-            # Helper to strip ANSI codes
-            def clean(s):
-                if not s: return ""
-                return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', s)
-
-            percent = clean(d.get('_percent_str', '0%')).strip()
-            # Try to get total size
-            total = clean(d.get('_total_bytes_str') or d.get('_total_bytes_approx_str', 'unknown size'))
-            speed = clean(d.get('_speed_str', '0B/s'))
-            eta = clean(d.get('_eta_str', '00:00'))
-            
-            progress_msg = f"{percent} of {total} at {speed} ETA {eta}"
-            self.progress.emit(progress_msg)
-        elif d['status'] == 'finished':
-            self.progress.emit("Finalizing file...")
 
 class ModernTab(QWidget):
     def __init__(self, platform_name, settings_tab=None):
